@@ -1,0 +1,4 @@
+2026-10-19T00:10:00Z [ERROR] postgres:5432 ConnectionTimeout: could not obtain connection from pool
+2026-10-19T00:10:05Z [ERROR] postgres:5432 ConnectionTimeout: pool wait limit exceeded (timeout 30s)
+2026-10-19T00:10:12Z [ERROR] auth-service: AuthFailure: token expired for user_id=9821
+2026-10-19T00:10:20Z [CRITICAL] system-monitor: DiskFull: /var/lib/postgresql volume reached 98% capacity

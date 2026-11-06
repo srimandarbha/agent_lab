@@ -1,0 +1,461 @@
+import os
+import glob
+import json
+import re
+import subprocess
+import uuid
+import yaml
+import httpx
+from typing import Annotated, Sequence, TypedDict, Optional
+
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+
+# =====================================================================
+# 1. Configuration
+# =====================================================================
+VELONA_API_URL = "https://velona.in/gateway/v1/inference/run"
+VELONA_API_KEY = os.environ.get("VELONA_API_KEY")
+MODEL_NAME = "openai/gpt-5-nano"
+#MODEL_NAME = "deepseek/deepseek-v4-flash"
+SKILLS_DIR = "./skills"
+
+# =====================================================================
+# 2. Local Deterministic Tool Implementations
+# =====================================================================
+def run_command(command: str) -> str:
+    """Executes a bash or shell script command safely and returns stdout/stderr."""
+    try:
+        res = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=15
+        )
+        return res.stdout or res.stderr or "Command executed with no output."
+    except Exception as e:
+        return f"Execution error: {str(e)}"
+
+def load_skill_body(skill_name: str) -> str:
+    """Reads the full procedural guidelines from SKILL.md for a given skill."""
+    path = os.path.join(SKILLS_DIR, skill_name, "SKILL.md")
+    if not os.path.exists(path):
+        return f"Error: Skill '{skill_name}' not found at {path}."
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+AVAILABLE_TOOLS = {
+    "run_command": run_command,
+    "load_skill_body": load_skill_body,
+}
+
+# =====================================================================
+# 3. Context Engineering: Progressive Disclosure & Prompt Assembly
+# =====================================================================
+def discover_skills():
+    """Level 1 Progressive Disclosure: Discovers skills catalog via YAML frontmatter."""
+    catalog = []
+    for skill_file in glob.glob(f"{SKILLS_DIR}/*/SKILL.md"):
+        try:
+            with open(skill_file, "r", encoding="utf-8") as f:
+                content = f.read()
+                if content.startswith("---"):
+                    parts = content.split("---", 2)
+                    meta = yaml.safe_load(parts[1])
+                    catalog.append({
+                        "name": meta.get("name"),
+                        "description": meta.get("description"),
+                    })
+        except Exception as err:
+            print(f"[!] Warning reading {skill_file}: {err}")
+    return catalog
+
+def build_system_instruction(active_skills: list[str]) -> str:
+    """Dynamically compiles system instructions and injects active skill runbooks into context."""
+    skills = discover_skills()
+    skills_yaml = yaml.dump(skills, default_flow_style=False) if skills else "No skills found."
+
+    # Level 2 Progressive Disclosure: inject loaded skill guidelines into working context
+    active_body = ""
+    if active_skills:
+        for s in active_skills:
+            body = load_skill_body(s)
+            active_body += f"\n--- ACTIVE SKILL PROCEDURE: {s} ---\n{body}\n"
+
+    return f"""You are an automated Site Reliability and Operations (SRE) Assistant.
+
+Available skills catalog:
+{skills_yaml}
+{active_body}
+Available Tools:
+- load_skill_body(skill_name: str): Loads full procedural instructions for a skill.
+- run_command(command: str): Executes a shell command or script.
+
+Tool Invocation Protocol:
+If you need to invoke a tool, respond ONLY with a JSON object in this exact schema:
+{{
+  "action": "<tool_name>",
+  "args": {{
+    "<arg_name>": "<arg_value>"
+  }}
+}}
+
+Workflow:
+1. When a user asks a task matching a skill, invoke load_skill_body if not already loaded.
+2. Follow the returned instructions and run any required scripts with run_command.
+3. If runbooks or reference files are mentioned, view or inspect them.
+4. Once all diagnostic data is collected, provide your final comprehensive SRE diagnosis and remediation plan in clear text.
+"""
+
+def repair_json_escapes(s: str) -> str:
+    """Repairs invalid escape sequences in JSON strings (e.g. bash grep/find regexes)."""
+    return re.sub(r'\\(?![/\\\"bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', s)
+
+def extract_action_json(text: str) -> Optional[dict]:
+    """Robustly extracts tool call JSON from markdown code fences or mixed text, repairing invalid escapes."""
+    candidates = []
+
+    # 1. Try markdown code block
+    code_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if code_block:
+        candidates.append(code_block.group(1))
+
+    # 2. Try nested or multiline JSON object containing "action"
+    action_match = re.search(r"(\{[^{}]*\"action\"\s*:\s*\"[^\"]+\"[^{}]*(?:\{[^{}]*\}[^{}]*)?\})", text, re.DOTALL)
+    if action_match:
+        candidates.append(action_match.group(1))
+
+    # 3. Try broader pattern matching curly braces with "action"
+    broad_match = re.search(r"(\{[\s\S]*\"action\"[\s\S]*\})", text)
+    if broad_match:
+        candidates.append(broad_match.group(1))
+
+    candidates.append(text.strip())
+
+    for c in candidates:
+        try:
+            data = json.loads(c)
+            if isinstance(data, dict) and "action" in data:
+                return data
+        except Exception:
+            pass
+        # Fallback: attempt escape repair
+        try:
+            repaired = repair_json_escapes(c)
+            data = json.loads(repaired)
+            if isinstance(data, dict) and "action" in data:
+                return data
+        except Exception:
+            pass
+
+    return None
+
+# =====================================================================
+# 4. Gateway API Caller
+# =====================================================================
+def call_velona(turns: list) -> str:
+    """Sends conversation turns to the Velona gateway endpoint."""
+    headers = {
+        "Authorization": f"Bearer {VELONA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "turns": turns,
+    }
+
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.post(VELONA_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["data"]["output"]
+
+# =====================================================================
+# 5. LangGraph AgentState Schema
+# =====================================================================
+class AgentState(TypedDict):
+    """Immutable state passed between all nodes in the StateGraph."""
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    active_skills: list[str]
+    reflection_notes: Optional[str]
+    is_verified: bool
+    retry_count: int
+    max_retries: int
+
+# =====================================================================
+# 6. Graph Nodes
+# =====================================================================
+def agent_node(state: AgentState) -> dict:
+    """
+    [Uses LLM] Reasoner / Actor Node.
+    Analyzes current state, loaded skills, and past feedback to decide
+    whether to call a tool or produce a draft diagnosis.
+    """
+    # Context Engineering: Compile dynamic system instruction
+    system_instruction = build_system_instruction(state.get("active_skills", []))
+
+    turns = [{"role": "system", "content": system_instruction}]
+    for msg in state["messages"]:
+        if isinstance(msg, HumanMessage):
+            turns.append({"role": "user", "content": str(msg.content)})
+        elif isinstance(msg, AIMessage):
+            turns.append({"role": "assistant", "content": str(msg.content)})
+        elif isinstance(msg, ToolMessage):
+            turns.append({"role": "user", "content": f"[Tool Output ({msg.name})]:\n{msg.content}"})
+        else:
+            turns.append({"role": "user", "content": str(msg.content)})
+
+    print("\n--- [Agent Node] Calling LLM (DeepSeek v4) ---")
+    output = call_velona(turns)
+
+    action_data = extract_action_json(output)
+
+    if action_data and "action" in action_data:
+        action = action_data.get("action")
+        args = action_data.get("args", {})
+        tool_call_id = f"call_{uuid.uuid4().hex[:8]}"
+        print(f"[*] Agent requested tool: {action}({args})")
+        ai_msg = AIMessage(
+            content=output,
+            tool_calls=[{"name": action, "args": args, "id": tool_call_id}]
+        )
+    else:
+        print("[*] Agent drafted a final response.")
+        ai_msg = AIMessage(content=output, tool_calls=[])
+
+    return {"messages": [ai_msg]}
+
+def tools_node(state: AgentState) -> dict:
+    """
+    [Deterministic, No LLM] Executor Node.
+    Executes tool calls locally (bash, file reads) and updates state.
+    """
+    last_message = state["messages"][-1]
+    tool_messages = []
+    new_active_skills = list(state.get("active_skills", []))
+
+    for tc in getattr(last_message, "tool_calls", []):
+        action = tc["name"]
+        args = tc.get("args", {})
+        print(f"\n[*] [Tools Node] Executing: {action}")
+
+        tool_func = AVAILABLE_TOOLS.get(action)
+        if tool_func:
+            try:
+                result = tool_func(**args)
+            except Exception as e:
+                result = f"Error executing {action}: {e}"
+        else:
+            result = f"Error: Tool '{action}' is not defined."
+
+        # Register newly loaded skills into active_skills state
+        if action == "load_skill_body" and "skill_name" in args:
+            skill_name = args["skill_name"]
+            if skill_name not in new_active_skills:
+                new_active_skills.append(skill_name)
+
+        print(f"[+] [Tools Node] Output: {str(result).strip()[:100]}...")
+        tool_messages.append(
+            ToolMessage(
+                content=str(result),
+                name=action,
+                tool_call_id=tc.get("id", str(uuid.uuid4()))
+            )
+        )
+
+    return {
+        "messages": tool_messages,
+        "active_skills": new_active_skills
+    }
+
+def reflector_node(state: AgentState) -> dict:
+    """
+    [Uses LLM] Critic / Reflection Node.
+    Audits the agent's draft response against actual tool evidence and active skill guidelines.
+    """
+    last_msg = state["messages"][-1]
+    draft = last_msg.content
+
+    # Extract original user prompt
+    user_query = ""
+    for msg in state["messages"]:
+        if isinstance(msg, HumanMessage) and not msg.content.startswith("[Reflection Feedback"):
+            user_query = msg.content
+            break
+
+    # Gather tool observations from history
+    tool_observations = []
+    for msg in state["messages"]:
+        if isinstance(msg, ToolMessage):
+            tool_observations.append(f"[{msg.name}]:\n{msg.content}")
+
+    obs_text = "\n---\n".join(tool_observations) if tool_observations else "No tools were executed."
+    active_skills = ", ".join(state.get("active_skills", [])) or "None"
+
+    critic_prompt = f"""You are a Principal SRE Reviewer and Quality Evaluator.
+
+User Incident Request:
+{user_query}
+
+Active Skills Applied:
+{active_skills}
+
+Actual Tool Outputs / Observations Gathered:
+{obs_text}
+
+Draft Diagnosis & Remediation Proposed by Agent:
+{draft}
+
+Audit Criteria:
+1. Grounding: Are the claims and root causes backed by actual tool outputs?
+2. Skill Compliance: Did the agent follow the skill workflow (e.g. running scripts, checking runbooks if applicable, providing clear remediation)?
+3. Completeness: Does the response provide both root causes and remediation?
+
+Respond ONLY in JSON format:
+{{
+  "is_satisfactory": true/false,
+  "critique": "Explanation of any deficiencies, or empty string if fully satisfactory",
+  "recommended_action": "Specific next step for the agent"
+}}
+"""
+    print("\n--- [Reflector Node] Auditing Draft Diagnosis ---")
+    response = call_velona([{"role": "user", "content": critic_prompt}])
+
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL)
+    raw = json_match.group(1) if json_match else response.strip()
+
+    is_satisfactory = True
+    critique = ""
+    recommended = ""
+    try:
+        parsed = json.loads(raw)
+        is_satisfactory = bool(parsed.get("is_satisfactory", True))
+        critique = parsed.get("critique", "")
+        recommended = parsed.get("recommended_action", "")
+    except Exception as err:
+        print(f"[!] Warning parsing critic output: {err}")
+        is_satisfactory = True
+
+    current_retries = state.get("retry_count", 0)
+
+    if is_satisfactory:
+        print("[+] [Reflector Node] Audit PASSED. Diagnosis approved.")
+        return {
+            "is_verified": True,
+            "reflection_notes": "",
+        }
+    else:
+        new_retry = current_retries + 1
+        print(f"[!] [Reflector Node] Audit FAILED (Retry {new_retry}/{state.get('max_retries', 2)}): {critique}")
+        feedback_msg = HumanMessage(
+            content=(
+                f"[Reflection Feedback (Attempt {new_retry}/{state.get('max_retries', 2)})]:\n"
+                f"Your diagnosis has issues: {critique}\n"
+                f"Recommended action: {recommended}\n"
+                f"Please execute any needed tools or revise your diagnosis."
+            )
+        )
+        return {
+            "is_verified": False,
+            "reflection_notes": critique,
+            "retry_count": new_retry,
+            "messages": [feedback_msg]
+        }
+
+# =====================================================================
+# 7. Loop Engineering: Conditional Edges
+# =====================================================================
+def route_agent(state: AgentState) -> str:
+    """Determines whether agent is calling a tool or submitting a draft for reflection."""
+    last_msg = state["messages"][-1]
+    if getattr(last_msg, "tool_calls", None):
+        return "tools"
+    return "reflector"
+
+def route_reflection(state: AgentState) -> str:
+    """Evaluates reflection results: terminates if verified or max retries reached, else loops back."""
+    if state.get("is_verified", False):
+        return END
+    if state.get("retry_count", 0) >= state.get("max_retries", 2):
+        print("\n[!] [Router] Max reflection retries reached. Finalizing best-effort response.")
+        return END
+    return "agent"
+
+# =====================================================================
+# 8. StateGraph Assembly
+# =====================================================================
+def build_agent_graph():
+    """Builds and compiles the StateGraph with inner ReAct loop and outer Reflection loop."""
+    builder = StateGraph(AgentState)
+
+    # 1. Register Nodes
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("reflector", reflector_node)
+
+    # 2. Register Entrypoint
+    builder.add_edge(START, "agent")
+
+    # 3. Inner Loop: Agent <-> Tools
+    builder.add_conditional_edges(
+        "agent",
+        route_agent,
+        {
+            "tools": "tools",
+            "reflector": "reflector",
+        }
+    )
+    builder.add_edge("tools", "agent")
+
+    # 4. Outer Loop: Agent <-> Reflector
+    builder.add_conditional_edges(
+        "reflector",
+        route_reflection,
+        {
+            "agent": "agent",
+            END: END,
+        }
+    )
+
+    return builder.compile()
+
+# =====================================================================
+# 9. Main Workflow Runner
+# =====================================================================
+def run_agent_workflow(initial_prompt: str, max_retries: int = 2):
+    """Executes the LangGraph SRE workflow from a user incident prompt."""
+    graph = build_agent_graph()
+
+    initial_state: AgentState = {
+        "messages": [HumanMessage(content=initial_prompt)],
+        "active_skills": [],
+        "reflection_notes": None,
+        "is_verified": False,
+        "retry_count": 0,
+        "max_retries": max_retries,
+    }
+
+    final_state = graph.invoke(initial_state)
+
+    for msg in reversed(final_state["messages"]):
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            print("\n=======================================================")
+            print("FINAL VERIFIED AGENT OUTPUT")
+            print("=======================================================")
+            print(msg.content)
+            return msg.content
+
+    return "No final answer generated."
+
+def main():
+    """Application entry point."""
+    user_query = "Production service is reporting high latency. Can you triage and inspect error logs?"
+    print(f"User Request: {user_query}")
+    run_agent_workflow(user_query)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,188 @@
+import os
+import glob
+import json
+import re
+import subprocess
+import yaml
+import httpx
+
+# =====================================================================
+# 1. Configuration
+# =====================================================================
+VELONA_API_URL = "https://velona.in/gateway/v1/inference/run"
+VELONA_API_KEY = os.environ.get("VELONA_API_KEY")
+#MODEL_NAME = "deepseek/deepseek-v4-flash"
+MODEL_NAME = "typesafe/jev-router"
+SKILLS_DIR = "./skills"
+
+# =====================================================================
+# 2. Local Tool Implementations
+# =====================================================================
+def run_command(command: str) -> str:
+    """Executes a bash or shell script command safely and returns stdout/stderr."""
+    try:
+        res = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=15
+        )
+        return res.stdout or res.stderr or "Command executed with no output."
+    except Exception as e:
+        return f"Execution error: {str(e)}"
+
+def load_skill_body(skill_name: str) -> str:
+    """Reads the full procedural guidelines from SKILL.md for a given skill."""
+    path = os.path.join(SKILLS_DIR, skill_name, "SKILL.md")
+    if not os.path.exists(path):
+        return f"Error: Skill '{skill_name}' not found at {path}."
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+# Map string tool names to local Python functions
+AVAILABLE_TOOLS = {
+    "run_command": run_command,
+    "load_skill_body": load_skill_body,
+}
+
+# =====================================================================
+# 3. Level 1 Progressive Disclosure: Discover Available Skills
+# =====================================================================
+def discover_skills():
+    """Scans all SKILL.md files and parses YAML frontmatter (Level 1)."""
+    catalog = []
+    for skill_file in glob.glob(f"{SKILLS_DIR}/*/SKILL.md"):
+        try:
+            with open(skill_file, "r", encoding="utf-8") as f:
+                content = f.read()
+                if content.startswith("---"):
+                    parts = content.split("---", 2)
+                    meta = yaml.safe_load(parts[1])
+                    catalog.append({
+                        "name": meta.get("name"),
+                        "description": meta.get("description"),
+                    })
+        except Exception as err:
+            print(f"[!] Warning reading {skill_file}: {err}")
+    return catalog
+
+# =====================================================================
+# 4. System Prompt Builder
+# =====================================================================
+SYSTEM_PROMPT_TEMPLATE = '''You are an automated Site Reliability and Operations Assistant.
+
+Available skills:
+{skills_catalog}
+
+Available Tools:
+- load_skill_body(skill_name: str): Loads full instructions for a skill.
+- run_command(command: str): Executes a shell command or script.
+
+If you need to invoke a tool, respond ONLY with a JSON object in this exact schema:
+{{
+  "action": "<tool_name>",
+  "args": {{
+    "<arg_name>": "<arg_value>"
+  }}
+}}
+
+Workflow:
+1. When a user asks a task matching a skill, invoke load_skill_body.
+2. Follow the returned instructions and run any required scripts with run_command.
+3. Once all actions are completed, write your final natural language response.
+'''
+
+def build_system_instruction() -> str:
+    skills = discover_skills()
+    skills_yaml = yaml.dump(skills, default_flow_style=False) if skills else "No skills found."
+    return SYSTEM_PROMPT_TEMPLATE.format(skills_catalog=skills_yaml)
+
+# =====================================================================
+# 5. Gateway API Caller
+# =====================================================================
+def call_velona(turns: list) -> str:
+    """Sends conversation turns to the Velona gateway endpoint."""
+    headers = {
+        "Authorization": f"Bearer {VELONA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "turns": turns,
+    }
+
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.post(VELONA_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["data"]["output"]
+
+# =====================================================================
+# 6. ReAct Agent Loop (Tool Dispatching Engine)
+# =====================================================================
+def run_agent_loop(initial_prompt: str, max_turns: int = 5):
+    """Orchestrates tool dispatch, output capture, and iterative turns."""
+    system_instruction = build_system_instruction()
+    turns = [
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": initial_prompt},
+    ]
+
+    for step in range(max_turns):
+        print(f"\n--- Turn {step + 1} ---")
+        try:
+            output = call_velona(turns)
+        except Exception as e:
+            print(f"[!] HTTP error calling Velona: {e}")
+            break
+
+        turns.append({"role": "assistant", "content": output})
+
+        # Extract JSON action from code fence or raw string
+        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", output, re.DOTALL)
+        raw_json = json_match.group(1) if json_match else output.strip()
+
+        try:
+            action_data = json.loads(raw_json)
+        except json.JSONDecodeError:
+            # Model generated a standard text answer (no tool calls requested)
+            print("\n--- Final Agent Output ---")
+            print(output)
+            return output
+
+        if isinstance(action_data, dict) and "action" in action_data:
+            action = action_data.get("action")
+            args = action_data.get("args", {})
+            print(f"[*] Calling tool: {action}({args})")
+
+            # -------------------------------------------------------------
+            # DYNAMIC FUNCTION CALL DISPATCH
+            # -------------------------------------------------------------
+            tool_func = AVAILABLE_TOOLS.get(action)
+            if tool_func:
+                result = tool_func(**args)
+            else:
+                result = f"Error: Tool '{action}' is not defined."
+
+            print(f"[+] Output: {result.strip()[:100]}...")
+
+            # Feed tool execution result back into turns
+            turns.append({
+                "role": "user",
+                "content": f"[Tool Result for {action}]:\n{result}",
+            })
+        else:
+            print("\n--- Final Agent Output ---")
+            print(output)
+            return output
+
+    print("\n[!] Execution ended: Maximum loop turns reached.")
+
+# =====================================================================
+# 7. Main Function Calling / Entry Point
+# =====================================================================
+def main():
+    """Main application entry point."""
+    user_query = "Production service is reporting high latency. Can you triage and inspect error logs?"
+    print(f"User Request: {user_query}")
+    run_agent_loop(user_query)
+
+if __name__ == "__main__":
+    main()
