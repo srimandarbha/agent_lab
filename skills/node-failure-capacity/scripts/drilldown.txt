@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Allowlisted, read-only PromQL drill-downs for node-failure-capacity.
+
+The LLM chooses a name from --list. It never sends PromQL. Limit: 3 calls per RUN_ID.
+
+Usage:
+  drilldown.py --list
+  drilldown.py --name NAME [--node NODE]
+
+Env:
+  PROM_URL    required
+  PROM_TOKEN  optional bearer token
+  RUN_ID      required, set by run_incident.py
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+import httpx
+
+MAX_CALLS = 3
+SAFE = re.compile(r"[A-Za-z0-9._-]+")
+
+ALLOWED = {
+    "node_top_memory_pods": {
+        "needs_node": True,
+        "promql": 'topk(10, sum by (namespace, pod) (kube_pod_container_resource_requests{resource="memory"}) and on (namespace, pod) kube_pod_info{node="{node}"})',
+        "purpose": "Top 10 pods by memory request on a node",
+    },
+    "node_top_cpu_pods": {
+        "needs_node": True,
+        "promql": 'topk(10, sum by (namespace, pod) (kube_pod_container_resource_requests{resource="cpu"}) and on (namespace, pod) kube_pod_info{node="{node}"})',
+        "purpose": "Top 10 pods by CPU request on a node",
+    },
+    "node_ready_condition": {
+        "needs_node": True,
+        "promql": 'kube_node_status_condition{node="{node}"} == 1',
+        "purpose": "Current status conditions of a node",
+    },
+    "node_pvc_by_namespace": {
+        "needs_node": True,
+        "promql": 'count by (namespace) (kube_pod_spec_volumes_persistentvolumeclaims_info and on (namespace, pod) kube_pod_info{node="{node}"})',
+        "purpose": "Pods with PVCs on a node, grouped by namespace",
+    },
+    "namespace_pvc_ranking": {
+        "needs_node": False,
+        "promql": "topk(10, count by (namespace) (kube_pod_spec_volumes_persistentvolumeclaims_info))",
+        "purpose": "Top 10 namespaces by number of pods with PVCs, cluster-wide",
+    },
+    "virt_handler_ready": {
+        "needs_node": False,
+        "promql": 'kube_daemonset_status_number_ready{namespace="openshift-cnv", daemonset="virt-handler"}',
+        "purpose": "virt-handler pods ready",
+    },
+    "virt_handler_desired": {
+        "needs_node": False,
+        "promql": 'kube_daemonset_status_desired_number_scheduled{namespace="openshift-cnv", daemonset="virt-handler"}',
+        "purpose": "virt-handler pods desired",
+    },
+    "degraded_cluster_operators": {
+        "needs_node": False,
+        "promql": 'cluster_operator_conditions{condition="Degraded", status="True"} == 1',
+        "purpose": "Cluster operators currently Degraded (verify label values on your version)",
+    },
+}
+
+
+def fail(msg):
+    print(json.dumps({"error": msg}))
+    return 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--name")
+    ap.add_argument("--node")
+    args = ap.parse_args()
+
+    if args.list:
+        print(json.dumps({n: {"needs_node": s["needs_node"], "purpose": s["purpose"]}
+                          for n, s in ALLOWED.items()}, indent=2))
+        return 0
+    if not args.name:
+        return fail("--name or --list is required")
+    if args.name not in ALLOWED:
+        return fail(f"unknown name; allowed: {', '.join(sorted(ALLOWED))}")
+    spec = ALLOWED[args.name]
+    if spec["needs_node"] and (not args.node or not SAFE.fullmatch(args.node)):
+        return fail("this query needs a valid --node")
+    if args.node and not SAFE.fullmatch(args.node):
+        return fail("invalid --node")
+
+    run_id = os.environ.get("RUN_ID", "")
+    if not SAFE.fullmatch(run_id):
+        return fail("RUN_ID is not set; start the run with run_incident.py")
+    base = os.environ.get("PROM_URL")
+    if not base:
+        return fail("PROM_URL is not set")
+    token = os.environ.get("PROM_TOKEN", "")
+
+    counter = f"/tmp/drilldown-{run_id}.count"
+    used = 0
+    if os.path.exists(counter):
+        with open(counter, encoding="utf-8") as f:
+            used = int(f.read().strip() or 0)
+    if used >= MAX_CALLS:
+        return fail(f"drill-down limit reached: {MAX_CALLS} per run")
+    with open(counter, "w", encoding="utf-8") as f:
+        f.write(str(used + 1))
+
+    promql = spec["promql"].replace("{node}", args.node or "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        r = httpx.get(f"{base.rstrip('/')}/api/v1/query", params={"query": promql},
+                      headers=headers, timeout=15.0)
+        r.raise_for_status()
+        body = r.json()
+    except Exception as exc:
+        return fail(f"query failed: {exc}")
+    if body.get("status") != "success":
+        return fail(f"prometheus error: {body.get('error', body)}")
+
+    series = body["data"]["result"]
+    rows = [{"labels": s["metric"], "value": s["value"][1]} for s in series[:20]]
+    print(json.dumps({"name": args.name, "node": args.node,
+                      "calls_used": used + 1, "calls_remaining": MAX_CALLS - used - 1,
+                      "row_count": len(series), "rows": rows}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
