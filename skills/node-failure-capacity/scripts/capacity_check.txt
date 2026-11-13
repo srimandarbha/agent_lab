@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Read-only capacity check: steady state and lose-one-node (N-1) for CPU, memory,
+and attached volumes. Placement of the lost pods is simulated largest first.
+
+Usage:
+  capacity_check.py --cluster NAME [--node NODE] [--affinity-file PATH]
+
+Env:
+  PROM_URL    required, Prometheus or Thanos Querier base URL
+  PROM_TOKEN  optional bearer token (read-only)
+
+Prints one JSON object. Errors are printed as {"error": ...}.
+"""
+import argparse
+import json
+import math
+import os
+import sys
+from collections import defaultdict
+
+import httpx
+import yaml
+
+CAP_FRACTION = 0.85
+POLICY_VOLUME_LIMIT = 250
+TIGHT_MARGIN = 0.05  # headroom under 5 percent of the cap is flagged as tight
+GiB = 1024 ** 3
+RES = ("cpu", "mem", "vol")
+RES_OUT = {"cpu": "cpu", "mem": "memory", "vol": "volumes"}
+
+QUERIES = {
+    "pod_info": 'kube_pod_info{node!=""}',
+    "pod_phase": 'kube_pod_status_phase{phase="Running"} == 1',
+    "pod_cpu": 'sum by (namespace, pod) (kube_pod_container_resource_requests{resource="cpu"})',
+    "pod_mem": 'sum by (namespace, pod) (kube_pod_container_resource_requests{resource="memory"})',
+    "pod_vols": 'count by (namespace, pod) (kube_pod_spec_volumes_persistentvolumeclaims_info)',
+    "pod_labels": "kube_pod_labels",
+    "node_cpu": 'kube_node_status_allocatable{resource="cpu"}',
+    "node_mem": 'kube_node_status_allocatable{resource="memory"}',
+    "node_vol": 'kube_node_status_allocatable{resource=~"attachable_volumes.*"}',
+    "node_ready": 'kube_node_status_condition{condition="Ready",status="true"} == 1',
+    "node_unsched": "kube_node_spec_unschedulable == 1",
+}
+
+
+def prom(base, token, promql):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    r = httpx.get(f"{base.rstrip('/')}/api/v1/query", params={"query": promql},
+                  headers=headers, timeout=20.0)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("status") != "success":
+        raise RuntimeError(str(body.get("error", body)))
+    return body["data"]["result"]
+
+
+def pod_key(m):
+    return (m.get("namespace", ""), m.get("pod", ""))
+
+
+def sum_by_pod(series):
+    out = defaultdict(float)
+    for s in series:
+        out[pod_key(s["metric"])] += float(s["value"][1])
+    return dict(out)
+
+
+def by_node(series, how):
+    out = {}
+    for s in series:
+        n = s["metric"].get("node")
+        if not n:
+            continue
+        v = float(s["value"][1])
+        if n not in out:
+            out[n] = v
+        elif how == "max":
+            out[n] = max(out[n], v)
+        else:
+            out[n] = min(out[n], v)
+    return out
+
+
+def node_set(series):
+    return {s["metric"].get("node") for s in series if s["metric"].get("node")}
+
+
+def load_rules(path):
+    if not path:
+        return None, "no affinity rules file provided"
+    if not os.path.exists(path):
+        return None, f"affinity file not found: {path}"
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    rules = []
+    for r in data.get("rules") or []:
+        workload = str(r.get("workload", ""))
+        rtype = r.get("type", "required")
+        selector = str(r.get("selector", ""))
+        if not workload:
+            raise ValueError("rule without workload")
+        if rtype not in ("required", "preferred"):
+            raise ValueError(f"type must be required or preferred ({workload})")
+        if "=" not in selector:
+            raise ValueError(f"selector must be key=value ({workload})")
+        key, value = selector.split("=", 1)
+        rules.append({"workload": workload, "type": rtype, "selector": selector,
+                      "key": key, "value": value})
+    return rules, None
+
+
+def build_model(raw):
+    pod_node = {}
+    for s in raw["pod_info"]:
+        node = s["metric"].get("node", "")
+        if node:
+            pod_node[pod_key(s["metric"])] = node
+    running = {pod_key(s["metric"]) for s in raw["pod_phase"]}
+    cpu = sum_by_pod(raw["pod_cpu"])
+    mem = sum_by_pod(raw["pod_mem"])
+    vols = sum_by_pod(raw["pod_vols"])
+
+    labels = defaultdict(dict)
+    for s in raw["pod_labels"]:
+        for k, v in s["metric"].items():
+            if k.startswith("label_"):
+                labels[pod_key(s["metric"])][k[len("label_"):]] = v
+
+    pods, no_requests, no_node = [], 0, 0
+    for key in sorted(running):
+        node = pod_node.get(key)
+        if node is None:
+            no_node += 1
+            continue
+        if key not in cpu and key not in mem:
+            no_requests += 1
+        pods.append({"name": f"{key[0]}/{key[1]}", "node": node,
+                     "cpu": cpu.get(key, 0.0), "mem": mem.get(key, 0.0) / GiB,
+                     "vol": vols.get(key, 0.0), "labels": dict(labels.get(key, {}))})
+
+    alloc_cpu = by_node(raw["node_cpu"], "max")
+    alloc_mem = {n: v / GiB for n, v in by_node(raw["node_mem"], "max").items()}
+    reported_vol = by_node(raw["node_vol"], "min")
+    ready = node_set(raw["node_ready"])
+    unsched = node_set(raw["node_unsched"])
+
+    names = set(alloc_cpu) | set(alloc_mem) | ready | unsched | {p["node"] for p in pods}
+    nodes = {}
+    for n in sorted(names):
+        reasons = []
+        if n not in alloc_cpu or n not in alloc_mem:
+            reasons.append("missing allocatable")
+        if n not in ready:
+            reasons.append("not Ready")
+        if n in unsched:
+            reasons.append("cordoned")
+        rep = reported_vol.get(n)
+        eff_vol = min(POLICY_VOLUME_LIMIT, rep) if rep is not None else POLICY_VOLUME_LIMIT
+        nodes[n] = {"eligible": not reasons, "reasons": reasons,
+                    "cpu": alloc_cpu.get(n, 0.0), "mem": alloc_mem.get(n, 0.0),
+                    "vol": eff_vol, "reported_vol": rep}
+    dq = {"no_requests": no_requests, "no_node": no_node,
+          "labels_available": bool(raw["pod_labels"])}
+    return pods, nodes, dq
+
+
+def cap_of(node):
+    return {r: CAP_FRACTION * node[r] for r in RES}
+
+
+def row(cap, load):
+    head = cap - load
+    return {"cap": round(cap, 2), "load": round(load, 2), "headroom": round(head, 2),
+            "result": "PASS" if load <= cap + 1e-9 else "FAIL",
+            "tight": cap > 0 and 0 <= head < TIGHT_MARGIN * cap}
+
+
+def affinity_reasons(pod, node_labels, rules):
+    out = []
+    for r in rules:
+        if r["type"] != "required" or not pod["name"].startswith(r["workload"]):
+            continue
+        if not any(lbl.get(r["key"]) == r["value"] for lbl in node_labels):
+            out.append(f"required affinity {r['selector']} not present on candidate node")
+    return out
+
+
+def explain(failures):
+    if not failures:
+        return "no surviving eligible node"
+    over, aff = set(), []
+    for o, a in failures:
+        over.update(o)
+        aff.extend(a)
+    parts = []
+    if over:
+        parts.append("no surviving node can take it without exceeding "
+                     + "/".join(RES_OUT[r] for r in RES if r in over))
+    if aff:
+        parts.append(sorted(set(aff))[0])
+    return "; ".join(parts) or "no fit"
+
+
+def simulate_loss(survivors, to_place, pods, nodes, rules, labels_ok):
+    state = {s: {"cpu": 0.0, "mem": 0.0, "vol": 0.0, "labels": []} for s in survivors}
+    for p in pods:
+        if p["node"] in state:
+            st = state[p["node"]]
+            for r in RES:
+                st[r] += p[r]
+            st["labels"].append(p["labels"])
+
+    active_rules = rules if (rules and labels_ok) else []
+    order = sorted(to_place, key=lambda p: (-p["cpu"], -p["mem"], -p["vol"], p["name"]))
+    placed, blocked = 0, []
+    for p in order:
+        best, best_free, failures = None, -1.0, []
+        for s in survivors:
+            cap = cap_of(nodes[s])
+            after = {r: state[s][r] + p[r] for r in RES}
+            over = [r for r in RES if after[r] > cap[r] + 1e-9]
+            aff = affinity_reasons(p, state[s]["labels"], active_rules) if active_rules else []
+            if over or aff:
+                failures.append((over, aff))
+                continue
+            free = min((cap[r] - after[r]) / cap[r] for r in RES if cap[r] > 0)
+            if free > best_free:
+                best, best_free = s, free
+        if best is None:
+            blocked.append({"pod": p["name"], "cpu": round(p["cpu"], 2),
+                            "memory": round(p["mem"], 2), "volumes": int(p["vol"]),
+                            "reason": explain(failures)})
+            continue
+        for r in RES:
+            state[best][r] += p[r]
+        state[best]["labels"].append(p["labels"])
+        placed += 1
+    return placed, blocked
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cluster", required=True)
+    ap.add_argument("--node")
+    ap.add_argument("--affinity-file")
+    args = ap.parse_args()
+
+    def fail(msg):
+        print(json.dumps({"cluster": args.cluster, "error": msg}))
+        return 1
+
+    base = os.environ.get("PROM_URL")
+    if not base:
+        return fail("PROM_URL is not set")
+    token = os.environ.get("PROM_TOKEN", "")
+
+    try:
+        raw = {name: prom(base, token, q) for name, q in QUERIES.items()}
+    except Exception as exc:
+        return fail(f"prometheus query failed: {exc}")
+    try:
+        rules, rules_note = load_rules(args.affinity_file)
+    except Exception as exc:
+        return fail(f"affinity file invalid: {exc}")
+
+    pods, nodes, dq = build_model(raw)
+    eligible = sorted(n for n, v in nodes.items() if v["eligible"])
+    excluded = [{"node": n, "reasons": v["reasons"]} for n, v in nodes.items() if not v["eligible"]]
+    mismatches = [{"node": n, "reported": int(v["reported_vol"]), "policy": POLICY_VOLUME_LIMIT}
+                  for n, v in nodes.items()
+                  if v["reported_vol"] is not None and int(v["reported_vol"]) != POLICY_VOLUME_LIMIT]
+    data_quality = {
+        "nodes_total": len(nodes), "nodes_eligible": len(eligible),
+        "excluded_nodes": excluded, "running_pods": len(pods),
+        "pods_without_requests": dq["no_requests"], "pods_without_node": dq["no_node"],
+        "volume_limit_mismatches": mismatches,
+    }
+    units = {"cpu": "cores", "memory": "GiB", "volumes": "count"}
+
+    if args.node and args.node not in eligible:
+        return fail(f"node {args.node} is not eligible; eligible nodes: {', '.join(eligible)}")
+
+    if not eligible or not pods:
+        print(json.dumps({"cluster": args.cluster, "verdict": "NOT DETERMINED",
+                          "verdict_reason": "no eligible nodes or no running pods",
+                          "units": units, "data_quality": data_quality}, indent=2))
+        return 0
+
+    # ---- steady state -------------------------------------------------
+    all_load = {r: sum(p[r] for p in pods) for r in RES}
+    avg_node = {r: sum(nodes[n][r] for n in eligible) / len(eligible) for r in RES}
+    cluster_cap = {r: CAP_FRACTION * sum(nodes[n][r] for n in eligible) for r in RES}
+    steady_cluster = {r: row(cluster_cap[r], all_load[r]) for r in RES}
+
+    steady_nodes = []
+    for n in eligible:
+        if args.node and n != args.node:
+            continue
+        load = {r: sum(p[r] for p in pods if p["node"] == n) for r in RES}
+        cap = cap_of(nodes[n])
+        rows = {r: row(cap[r], load[r]) for r in RES}
+        steady_nodes.append({
+            "node": n,
+            "cpu": rows["cpu"], "memory": rows["mem"], "volumes": rows["vol"],
+            "volume_limit": nodes[n]["vol"],
+            "result": "PASS" if all(rows[r]["result"] == "PASS" for r in RES) else "FAIL",
+        })
+    steady_fail = any(steady_cluster[r]["result"] == "FAIL" for r in RES) or \
+        any(x["result"] == "FAIL" for x in steady_nodes)
+    steady_verdict = "FAIL" if steady_fail else "PASS"
+
+    # ---- lose one node (N-1) -------------------------------------------
+    rules_list = rules or []
+    labels_ok = dq["labels_available"]
+    scopes = []
+    targets = [args.node] if args.node else eligible
+    for lost in targets:
+        survivors = [n for n in eligible if n != lost]
+        if not survivors:
+            scopes.append({"lost_node": lost, "result": "FAIL",
+                           "reason": "no surviving eligible node"})
+            continue
+        surv_cap = {r: CAP_FRACTION * sum(nodes[s][r] for s in survivors) for r in RES}
+        cl = {r: row(surv_cap[r], all_load[r]) for r in RES}
+        estimate = {}
+        for r in RES:
+            short = max(0.0, -(surv_cap[r] - all_load[r]))
+            estimate[RES_OUT[r]] = math.ceil(short / (CAP_FRACTION * avg_node[r])) if short > 0 else 0
+        to_place = [p for p in pods if p["node"] not in survivors]
+        placed, blocked = simulate_loss(survivors, to_place, pods, nodes, rules_list, labels_ok)
+        short_res = [RES_OUT[r] for r in RES if cl[r]["result"] == "FAIL"]
+        ok = not short_res and not blocked
+        reason_parts = []
+        if short_res:
+            reason_parts.append("short on " + "/".join(short_res))
+        if blocked:
+            reason_parts.append(f"{len(blocked)} pod(s) cannot be placed")
+        scopes.append({
+            "lost_node": lost,
+            "cluster": {RES_OUT[r]: cl[r] for r in RES},
+            "nodes_to_add_estimate": estimate,
+            "pods_to_place": len(to_place),
+            "placed": placed,
+            "blocked": blocked,
+            "result": "PASS" if ok else "FAIL",
+            "reason": "; ".join(reason_parts) or "fits within 85 percent",
+        })
+    n1_verdict = "FAIL" if any(s["result"] == "FAIL" for s in scopes) else "PASS"
+
+    # ---- affinity -----------------------------------------------------
+    if rules is None:
+        affinity = {"status": "NOT EVALUATED", "reason": rules_note}
+    elif not labels_ok:
+        affinity = {"status": "NOT EVALUATED",
+                    "reason": "kube_pod_labels not exported; rules cannot be matched to pods",
+                    "rules_listed": len(rules)}
+    else:
+        affinity = {"status": "EVALUATED", "rules": [
+            {"workload": r["workload"], "type": r["type"], "selector": r["selector"],
+             "matched_running_pods": sum(1 for p in pods if p["name"].startswith(r["workload"]))}
+            for r in rules]}
+        affinity["blocked_moves"] = sum(
+            1 for s in scopes for b in s.get("blocked", []) if "affinity" in b["reason"])
+
+    # ---- verdict and warnings -----------------------------------------
+    if steady_fail or n1_verdict == "FAIL":
+        verdict = "FAIL"
+    elif affinity["status"] != "EVALUATED":
+        verdict = "PASS (capacity), AFFINITY NOT EVALUATED"
+    else:
+        verdict = "PASS"
+
+    reasons = []
+    for x in steady_nodes:
+        if x["result"] == "FAIL":
+            bad = [k for k in ("cpu", "memory", "volumes") if x[k]["result"] == "FAIL"]
+            reasons.append(f"steady state: {x['node']} over 85 percent on {'/'.join(bad)}")
+    if any(steady_cluster[r]["result"] == "FAIL" for r in RES):
+        bad = [RES_OUT[r] for r in RES if steady_cluster[r]["result"] == "FAIL"]
+        reasons.append(f"steady state cluster over 85 percent on {'/'.join(bad)}")
+    for s in scopes:
+        if s["result"] == "FAIL":
+            reasons.append(f"lose {s['lost_node']}: {s['reason']}")
+    if not reasons and verdict != "PASS":
+        reasons.append(affinity.get("reason", ""))
+
+    warnings = []
+    for r in RES:
+        if steady_cluster[r]["tight"]:
+            warnings.append(f"steady state cluster {RES_OUT[r]} is tight")
+    for s in scopes:
+        for r in RES:
+            if s.get("cluster", {}).get(RES_OUT[r], {}).get("tight"):
+                warnings.append(f"lose {s['lost_node']}: {RES_OUT[r]} is tight")
+    for m in mismatches:
+        warnings.append(f"{m['node']} reports {m['reported']} attachable volumes, policy is {m['policy']}; "
+                        f"effective limit is {m['reported']}")
+    if excluded:
+        warnings.append(f"{len(excluded)} node(s) excluded from capacity math")
+    if dq["no_requests"]:
+        warnings.append(f"{dq['no_requests']} running pod(s) have no CPU or memory requests")
+    if dq["no_node"]:
+        warnings.append(f"{dq['no_node']} running pod(s) have no node mapping and were skipped")
+    if affinity["status"] != "EVALUATED":
+        warnings.append("affinity not evaluated: " + affinity.get("reason", ""))
+
+    result = {
+        "cluster": args.cluster,
+        "cap_fraction": CAP_FRACTION,
+        "policy_volume_limit": POLICY_VOLUME_LIMIT,
+        "units": units,
+        "verdict": verdict,
+        "verdict_reason": "; ".join(reasons) if reasons else "all checks within 85 percent",
+        "steady_state": {"verdict": steady_verdict, "cluster": {RES_OUT[r]: steady_cluster[r] for r in RES},
+                         "nodes": steady_nodes},
+        "n_minus_1": {"verdict": n1_verdict, "scopes": scopes},
+        "affinity": affinity,
+        "data_quality": data_quality,
+        "warnings": warnings,
+    }
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
