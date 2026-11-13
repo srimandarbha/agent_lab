@@ -1,0 +1,17 @@
+# Maintained pod affinity rules. Empty by default, so affinity is reported as NOT EVALUATED.
+#
+# workload: matched against "namespace/pod-name" by prefix
+# type:     required  -> the pod can only be placed on a surviving node that already runs a pod
+#                        with the selector label (kubernetes.io/hostname topology)
+#           preferred -> listed in the report, never blocks a move
+# selector: key=value, matched against pod labels from kube_pod_labels (label_<key>)
+# owner and last_reviewed are for humans and are not used by the script.
+#
+# Example entry (uncomment and edit):
+# rules:
+#   - workload: vm-workloads/payments-api
+#     type: required
+#     selector: app=payments-cache
+#     owner: team-payments
+#     last_reviewed: 2026-11-01
+rules: []
