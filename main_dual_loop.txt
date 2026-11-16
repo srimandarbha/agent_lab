@@ -1,0 +1,513 @@
+import os
+import glob
+import json
+import re
+import shlex
+import subprocess
+import uuid
+import logging
+from typing import Annotated, Sequence, TypedDict, Optional
+
+import yaml
+import httpx
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+)
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
+
+# =====================================================================
+# 1. Configuration
+# =====================================================================
+VELONA_API_URL = "https://velona.in/gateway/v1/inference/run"
+VELONA_API_KEY = os.environ.get("VELONA_API_KEY")
+MODEL_NAME = "openai/gpt-5-nano"
+SKILLS_DIR = "./skills"
+MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "12"))   # agent LLM calls per run
+DEFAULT_MAX_RETRIES = 2                                     # reflector retries per run
+RECURSION_LIMIT = 100                                       # LangGraph superstep cap
+
+log = logging.getLogger("sre_agent")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+# =====================================================================
+# 2. Command policy (fail-closed)
+# =====================================================================
+READ_ONLY_BINARIES = {
+    "cat", "grep", "egrep", "tail", "head", "wc", "ls", "find", "awk", "sed",
+    "ps", "df", "du", "uptime", "free", "journalctl", "dmesg", "date",
+    "sort", "uniq", "cut", "tr", "stat", "echo",
+}
+# Any of these anywhere in the command makes it mutating.
+MUTATING_MARKERS = (">", "$(", "`", "-delete", "-exec", "sed -i", "--in-place")
+_SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\|")
+
+
+def is_mutating(command: str) -> bool:
+    """
+    Fail-closed classifier. A command counts as read-only only if it has no
+    write markers and every pipeline segment starts with an allowlisted binary.
+    This is a heuristic guard; run the agent in a sandbox for a hard boundary.
+    """
+    command = (command or "").strip()
+    if not command:
+        return True
+    if any(marker in command for marker in MUTATING_MARKERS):
+        return True
+    for segment in _SEGMENT_SPLIT.split(command):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            binary = shlex.split(segment)[0]
+        except ValueError:
+            return True
+        if os.path.basename(binary) not in READ_ONLY_BINARIES:
+            return True
+    return False
+
+# =====================================================================
+# 3. Local Tool Implementations
+# =====================================================================
+def run_command(command: str) -> str:
+    """Executes a shell command and returns stdout/stderr."""
+    try:
+        res = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=15
+        )
+        return res.stdout or res.stderr or "Command executed with no output."
+    except Exception as e:
+        return f"Execution error: {str(e)}"
+
+
+def load_skill_body(skill_name: str) -> str:
+    """Reads the full procedural guidelines from SKILL.md for a given skill."""
+    path = os.path.join(SKILLS_DIR, skill_name, "SKILL.md")
+    if not os.path.exists(path):
+        return f"Error: Skill '{skill_name}' not found at {path}."
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+AVAILABLE_TOOLS = {
+    "run_command": run_command,
+    "load_skill_body": load_skill_body,
+}
+
+# =====================================================================
+# 4. Progressive Disclosure & Prompt Assembly
+# =====================================================================
+def discover_skills(allowed: Optional[list[str]] = None) -> list[dict]:
+    """Level 1: skill catalog from YAML frontmatter. allowed=None means all skills."""
+    catalog = []
+    for skill_file in glob.glob(f"{SKILLS_DIR}/*/SKILL.md"):
+        try:
+            with open(skill_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            if content.startswith("---"):
+                meta = yaml.safe_load(content.split("---", 2)[1])
+                name = meta.get("name")
+                if allowed is not None and name not in allowed:
+                    continue
+                catalog.append({"name": name, "description": meta.get("description")})
+        except Exception as err:
+            log.warning("Could not read %s: %s", skill_file, err)
+    return catalog
+
+
+def build_system_instruction(active_skills: list[str], allowed_skills: Optional[list[str]] = None) -> str:
+    """Compiles the system prompt. Level 2: injects loaded skill bodies."""
+    skills = discover_skills(allowed_skills)
+    skills_yaml = yaml.dump(skills, default_flow_style=False) if skills else "No skills found."
+
+    active_body = ""
+    for s in active_skills:
+        if allowed_skills is not None and s not in allowed_skills:
+            continue
+        active_body += f"\n--- ACTIVE SKILL PROCEDURE: {s} ---\n{load_skill_body(s)}\n"
+
+    return f"""You are an automated Site Reliability and Operations (SRE) Assistant.
+
+Available skills catalog:
+{skills_yaml}
+{active_body}
+Available Tools:
+- load_skill_body(skill_name: str): Loads full procedural instructions for a skill.
+- run_command(command: str): Executes a shell command or script. Prefer read-only commands.
+
+Tool Invocation Protocol:
+If you need to invoke a tool, respond ONLY with a JSON object in this exact schema:
+{{
+  "action": "<tool_name>",
+  "args": {{
+    "<arg_name>": "<arg_value>"
+  }}
+}}
+
+Workflow:
+1. When a user asks a task matching a skill, invoke load_skill_body if not already loaded.
+2. Follow the returned instructions and run any required scripts with run_command.
+3. If a command is rejected by the operator, do not retry it. Use a read-only alternative.
+4. Once all diagnostic data is collected, provide your final SRE diagnosis and remediation plan in clear text.
+"""
+
+
+def repair_json_escapes(s: str) -> str:
+    """Repairs invalid escape sequences in JSON strings (e.g. bash grep/find regexes)."""
+    return re.sub(r'\\(?![/\\\"bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', s)
+
+
+def extract_action_json(text: str) -> Optional[dict]:
+    """Extracts a tool-call JSON object from fences or mixed text, repairing escapes."""
+    candidates = []
+    code_block = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if code_block:
+        candidates.append(code_block.group(1))
+    broad_match = re.search(r"(\{[\s\S]*\"action\"[\s\S]*\})", text)
+    if broad_match:
+        candidates.append(broad_match.group(1))
+    candidates.append(text.strip())
+
+    for c in candidates:
+        for attempt in (c, repair_json_escapes(c)):
+            try:
+                data = json.loads(attempt)
+                if isinstance(data, dict) and "action" in data:
+                    return data
+            except Exception:
+                pass
+    return None
+
+# =====================================================================
+# 5. LLM Gateway
+# =====================================================================
+def call_velona(turns: list) -> str:
+    """Sends conversation turns to the Velona gateway endpoint."""
+    headers = {
+        "Authorization": f"Bearer {VELONA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": MODEL_NAME, "turns": turns}
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.post(VELONA_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()["data"]["output"]
+
+# =====================================================================
+# 6. State
+# =====================================================================
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    active_skills: list[str]
+    reflection_notes: Optional[str]
+    is_verified: bool
+    retry_count: int
+    max_retries: int
+    steps: int                      # agent LLM calls so far (step budget)
+    blocked_call_ids: list[str]     # tool calls the operator rejected this turn
+
+# =====================================================================
+# 7. Nodes
+# =====================================================================
+def agent_node(state: AgentState) -> dict:
+    """[LLM] Reasoner. Stops with a budget message once MAX_STEPS is reached."""
+    steps = state.get("steps", 0)
+    if steps >= MAX_STEPS:
+        log.warning("Step budget (%d) exhausted; forcing finalization.", MAX_STEPS)
+        msg = AIMessage(
+            content=(
+                "Step budget exhausted before the diagnosis was complete. Report what has "
+                "been verified so far, and list the remaining checks as open items."
+            ),
+            tool_calls=[],
+        )
+        return {"messages": [msg], "steps": steps}
+
+    system_instruction = build_system_instruction(state.get("active_skills", []))
+    turns = [{"role": "system", "content": system_instruction}]
+    for msg in state["messages"]:
+        if isinstance(msg, HumanMessage):
+            turns.append({"role": "user", "content": str(msg.content)})
+        elif isinstance(msg, AIMessage):
+            turns.append({"role": "assistant", "content": str(msg.content)})
+        elif isinstance(msg, ToolMessage):
+            turns.append({"role": "user", "content": f"[Tool Output ({msg.name})]:\n{msg.content}"})
+        else:
+            turns.append({"role": "user", "content": str(msg.content)})
+
+    log.info("Agent step %d/%d", steps + 1, MAX_STEPS)
+    output = call_velona(turns)
+    action_data = extract_action_json(output)
+
+    if action_data and "action" in action_data:
+        action = action_data.get("action")
+        args = action_data.get("args", {}) or {}
+        tool_call_id = f"call_{uuid.uuid4().hex[:8]}"
+        ai_msg = AIMessage(
+            content=output,
+            tool_calls=[{"name": action, "args": args, "id": tool_call_id}],
+        )
+    else:
+        ai_msg = AIMessage(content=output, tool_calls=[])
+
+    return {"messages": [ai_msg], "steps": steps + 1}
+
+
+def guard_node(state: AgentState) -> dict:
+    """
+    [Deterministic, no LLM] Command guard. Mutating commands pause for approval.
+    Contains no LLM call, so re-running it on resume is safe.
+    """
+    last = state["messages"][-1]
+    pending = [
+        tc for tc in last.tool_calls
+        if tc["name"] == "run_command"
+        and is_mutating(str((tc.get("args") or {}).get("command", "")))
+    ]
+    if not pending:
+        return {"blocked_call_ids": []}
+
+    decision = interrupt({
+        "commands": [
+            {"id": tc["id"], "command": tc["args"].get("command")} for tc in pending
+        ],
+        "question": "Approve the mutating commands listed above?",
+    })
+    approved = set((decision or {}).get("approved_ids", []))
+    blocked = [tc["id"] for tc in pending if tc["id"] not in approved]
+    return {"blocked_call_ids": blocked}
+
+
+def tools_node(state: AgentState) -> dict:
+    """[Deterministic] Executes approved tool calls and records rejections."""
+    last = state["messages"][-1]
+    blocked = set(state.get("blocked_call_ids", []))
+    tool_messages = []
+    new_active_skills = list(state.get("active_skills", []))
+
+    for tc in getattr(last, "tool_calls", []):
+        action = tc["name"]
+        args = tc.get("args", {}) or {}
+        tc_id = tc.get("id") or str(uuid.uuid4())
+
+        if tc_id in blocked:
+            result = (
+                "REJECTED: the operator did not approve this mutating command. "
+                "Do not retry it. Choose a read-only check or propose an alternative."
+            )
+        else:
+            tool_func = AVAILABLE_TOOLS.get(action)
+            if tool_func is None:
+                result = f"Error: Tool '{action}' is not defined."
+            else:
+                try:
+                    result = tool_func(**args)
+                except Exception as e:
+                    result = f"Error executing {action}: {e}"
+
+        if action == "load_skill_body" and "skill_name" in args:
+            skill_name = args["skill_name"]
+            if skill_name not in new_active_skills:
+                new_active_skills.append(skill_name)
+
+        tool_messages.append(
+            ToolMessage(content=str(result), name=action, tool_call_id=tc_id)
+        )
+
+    return {"messages": tool_messages, "active_skills": new_active_skills}
+
+
+def reflector_node(state: AgentState) -> dict:
+    """[LLM] Critic. Fails closed: unparseable audits count as failures."""
+    last_msg = state["messages"][-1]
+    draft = last_msg.content
+
+    user_query = ""
+    for msg in state["messages"]:
+        if isinstance(msg, HumanMessage) and not str(msg.content).startswith("[Reflection Feedback"):
+            user_query = msg.content
+            break
+
+    tool_observations = [
+        f"[{msg.name}]:\n{msg.content}"
+        for msg in state["messages"] if isinstance(msg, ToolMessage)
+    ]
+    obs_text = "\n---\n".join(tool_observations) or "No tools were executed."
+    active_skills = ", ".join(state.get("active_skills", [])) or "None"
+
+    critic_prompt = f"""You are a Principal SRE Reviewer and Quality Evaluator.
+
+User Incident Request:
+{user_query}
+
+Active Skills Applied:
+{active_skills}
+
+Actual Tool Outputs / Observations Gathered:
+{obs_text}
+
+Draft Diagnosis & Remediation Proposed by Agent:
+{draft}
+
+Audit Criteria:
+1. Grounding: Are the claims and root causes backed by actual tool outputs?
+2. Skill Compliance: Did the agent follow the skill workflow?
+3. Completeness: Does the response provide both root causes and remediation?
+
+Respond ONLY in JSON:
+{{
+  "is_satisfactory": true/false,
+  "critique": "Explanation of any deficiencies, or empty string if fully satisfactory",
+  "recommended_action": "Specific next step for the agent"
+}}
+"""
+    response = call_velona([{"role": "user", "content": critic_prompt}])
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL)
+    raw = json_match.group(1) if json_match else response.strip()
+
+    try:
+        parsed = json.loads(raw)
+        value = parsed["is_satisfactory"]
+        is_satisfactory = value if isinstance(value, bool) else str(value).lower() == "true"
+        critique = parsed.get("critique", "")
+        recommended = parsed.get("recommended_action", "")
+    except Exception as err:
+        log.warning("Reflector output unparseable (%s); failing closed.", err)
+        is_satisfactory = False
+        critique = f"Auditor output could not be parsed ({err})."
+        recommended = "Re-check root causes and remediation against tool evidence."
+
+    current_retries = state.get("retry_count", 0)
+    max_retries = state.get("max_retries", DEFAULT_MAX_RETRIES)
+
+    if is_satisfactory:
+        log.info("Reflector PASSED.")
+        return {"is_verified": True, "reflection_notes": ""}
+
+    new_retry = current_retries + 1
+    log.warning("Reflector FAILED (retry %d/%d): %s", new_retry, max_retries, critique)
+    feedback_msg = HumanMessage(
+        content=(
+            f"[Reflection Feedback (Attempt {new_retry}/{max_retries})]:\n"
+            f"Your diagnosis has issues: {critique}\n"
+            f"Recommended action: {recommended}\n"
+            f"Please execute any needed tools or revise your diagnosis."
+        )
+    )
+    return {
+        "is_verified": False,
+        "reflection_notes": critique,
+        "retry_count": new_retry,
+        "messages": [feedback_msg],
+    }
+
+# =====================================================================
+# 8. Routing
+# =====================================================================
+def route_agent(state: AgentState) -> str:
+    last_msg = state["messages"][-1]
+    if getattr(last_msg, "tool_calls", None):
+        return "guard"
+    return "reflector"
+
+
+def route_reflection(state: AgentState) -> str:
+    if state.get("is_verified", False):
+        return END
+    if state.get("retry_count", 0) >= state.get("max_retries", DEFAULT_MAX_RETRIES):
+        log.warning("Max reflection retries reached. Returning best-effort, UNVERIFIED answer.")
+        return END
+    return "agent"
+
+# =====================================================================
+# 9. Graph Assembly
+# =====================================================================
+def build_agent_graph(checkpointer=None):
+    builder = StateGraph(AgentState)
+
+    builder.add_node("agent", agent_node)
+    builder.add_node("guard", guard_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("reflector", reflector_node)
+
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", route_agent, {"guard": "guard", "reflector": "reflector"})
+    builder.add_edge("guard", "tools")
+    builder.add_edge("tools", "agent")
+    builder.add_conditional_edges("reflector", route_reflection, {"agent": "agent", END: END})
+
+    # MemorySaver is for development. Use a persistent saver (e.g. SqliteSaver or PostgresSaver) in production.
+    return builder.compile(checkpointer=checkpointer or MemorySaver())
+
+# =====================================================================
+# 10. Human approval and runner
+# =====================================================================
+def ask_operator(request: dict) -> dict:
+    """Terminal approval prompt. Replace with a Slack/web approval in production."""
+    print("\n[HITL] The agent wants to run mutating commands:")
+    for c in request["commands"]:
+        print(f"  id={c['id']}: {c['command']}")
+    answer = input("Approve which ids? ('all', comma-separated ids, or blank for none): ").strip()
+    if answer == "all":
+        ids = [c["id"] for c in request["commands"]]
+    else:
+        ids = [x.strip() for x in answer.split(",") if x.strip()]
+    return {"approved_ids": ids}
+
+
+def run_agent_workflow(initial_prompt: str, max_retries: int = DEFAULT_MAX_RETRIES,
+                       approver=None, thread_id: Optional[str] = None) -> str:
+    graph = build_agent_graph()
+    config = {
+        "configurable": {"thread_id": thread_id or str(uuid.uuid4())},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+    initial_state: AgentState = {
+        "messages": [HumanMessage(content=initial_prompt)],
+        "active_skills": [],
+        "reflection_notes": None,
+        "is_verified": False,
+        "retry_count": 0,
+        "max_retries": max_retries,
+        "steps": 0,
+        "blocked_call_ids": [],
+    }
+
+    graph.invoke(initial_state, config)
+
+    # Resume loop: each interrupt is answered by the approver, then the graph continues.
+    while True:
+        snapshot = graph.get_state(config)
+        if not snapshot.next:
+            break
+        pending = [i for t in snapshot.tasks for i in t.interrupts]
+        request = pending[0].value if pending else {}
+        decision = (approver or ask_operator)(request)
+        graph.invoke(Command(resume=decision), config)
+
+    values = graph.get_state(config).values
+    verified = values.get("is_verified", False)
+    for msg in reversed(values["messages"]):
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            label = "VERIFIED" if verified else "UNVERIFIED (best effort)"
+            print("\n=======================================================")
+            print(f"FINAL AGENT OUTPUT [{label}]")
+            print("=======================================================")
+            print(msg.content)
+            return msg.content
+    return "No final answer generated."
+
+
+def main():
+    user_query = "Production service is reporting high latency. Can you triage and inspect error logs?"
+    print(f"User Request: {user_query}")
+    run_agent_workflow(user_query)
+
+
+if __name__ == "__main__":
+    main()

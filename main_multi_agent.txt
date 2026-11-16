@@ -1,0 +1,543 @@
+import os
+import glob
+import json
+import re
+import shlex
+import operator
+import subprocess
+import uuid
+import logging
+from typing import Annotated, TypedDict, Optional
+
+import yaml
+import httpx
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command, Send
+
+# =====================================================================
+# 1. Configuration
+# =====================================================================
+VELONA_API_URL = "https://velona.in/gateway/v1/inference/run"
+VELONA_API_KEY = os.environ.get("VELONA_API_KEY")
+MODEL_NAME = "openai/gpt-5-nano"
+SKILLS_DIR = "./skills"
+MAX_SUPERVISOR_STEPS = int(os.environ.get("SUPERVISOR_MAX_STEPS", "6"))
+WORKER_MAX_STEPS = int(os.environ.get("WORKER_MAX_STEPS", "4"))
+DEFAULT_MAX_RETRIES = 2
+RECURSION_LIMIT = 100
+SUMMARY_CHAR_LIMIT = 1500
+
+log = logging.getLogger("sre_team")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+# =====================================================================
+# 2. Command policy (fail-closed)
+# =====================================================================
+READ_ONLY_BINARIES = {
+    "cat", "grep", "egrep", "tail", "head", "wc", "ls", "find", "awk", "sed",
+    "ps", "df", "du", "uptime", "free", "journalctl", "dmesg", "date",
+    "sort", "uniq", "cut", "tr", "stat", "echo",
+}
+MUTATING_MARKERS = (">", "$(", "`", "-delete", "-exec", "sed -i", "--in-place")
+_SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\|")
+
+
+def is_mutating(command: str) -> bool:
+    """Fail-closed: read-only only if no write markers and every segment is allowlisted."""
+    command = (command or "").strip()
+    if not command:
+        return True
+    if any(marker in command for marker in MUTATING_MARKERS):
+        return True
+    for segment in _SEGMENT_SPLIT.split(command):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            binary = shlex.split(segment)[0]
+        except ValueError:
+            return True
+        if os.path.basename(binary) not in READ_ONLY_BINARIES:
+            return True
+    return False
+
+# =====================================================================
+# 3. Tools (a registry; each agent gets a subset via AGENT_SCOPES)
+# =====================================================================
+def run_command(command: str) -> str:
+    """Executes a shell command and returns stdout/stderr."""
+    try:
+        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=15)
+        return res.stdout or res.stderr or "Command executed with no output."
+    except Exception as e:
+        return f"Execution error: {str(e)}"
+
+
+def load_skill_body(skill_name: str) -> str:
+    """Reads the full SKILL.md for a skill. The caller's scope decides which skills are allowed."""
+    path = os.path.join(SKILLS_DIR, skill_name, "SKILL.md")
+    if not os.path.exists(path):
+        return f"Error: Skill '{skill_name}' not found at {path}."
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+TOOL_IMPLS = {
+    "run_command": run_command,
+    "load_skill_body": load_skill_body,
+}
+
+# =====================================================================
+# 4. Agent scopes: the security boundary lives here, not in SKILL.md
+# =====================================================================
+# A skill says HOW to investigate. The scope says WHAT the agent may do.
+AGENT_SCOPES = {
+    "log_agent": {
+        "role": "LOG SPECIALIST",
+        "description": "Searches application logs for errors, timeouts, 5xx, and stack traces. Read-only.",
+        "skills": ["log-inspector"],
+        "tools": ["run_command", "load_skill_body"],
+        "read_only": True,
+    },
+    "health_agent": {
+        "role": "HEALTH SPECIALIST",
+        "description": "Checks host load, memory, disk, and processes. Read-only.",
+        "skills": [],
+        "tools": ["run_command"],
+        "read_only": True,
+    },
+}
+
+# Supervisor routes. "remediation" is a separate gated sub-flow, not a worker.
+SUPERVISOR_CHOICES = list(AGENT_SCOPES) + ["remediation"]
+
+# =====================================================================
+# 5. Shared helpers
+# =====================================================================
+def discover_skills(allowed: Optional[list[str]] = None) -> list[dict]:
+    catalog = []
+    for skill_file in glob.glob(f"{SKILLS_DIR}/*/SKILL.md"):
+        try:
+            with open(skill_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            if content.startswith("---"):
+                meta = yaml.safe_load(content.split("---", 2)[1])
+                if allowed is not None and meta.get("name") not in allowed:
+                    continue
+                catalog.append({"name": meta.get("name"), "description": meta.get("description")})
+        except Exception as err:
+            log.warning("Could not read %s: %s", skill_file, err)
+    return catalog
+
+
+def repair_json_escapes(s: str) -> str:
+    return re.sub(r'\\(?![/\\\"bfnrt]|u[0-9a-fA-F]{4})', r'\\\\', s)
+
+
+def extract_json_object(text: str, must_key: Optional[str] = None) -> Optional[dict]:
+    """Finds a JSON object in fences or mixed text. If must_key is given, requires that key."""
+    candidates = []
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        candidates.append(fence.group(1))
+    broad = re.search(r"(\{[\s\S]*\})", text)
+    if broad:
+        candidates.append(broad.group(1))
+    candidates.append(text.strip())
+
+    for c in candidates:
+        for attempt in (c, repair_json_escapes(c)):
+            try:
+                data = json.loads(attempt)
+                if isinstance(data, dict) and (must_key is None or must_key in data):
+                    return data
+            except Exception:
+                pass
+    return None
+
+
+def call_velona(turns: list) -> str:
+    headers = {
+        "Authorization": f"Bearer {VELONA_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"model": MODEL_NAME, "turns": turns}
+    with httpx.Client(timeout=60.0) as client:
+        resp = client.post(VELONA_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()["data"]["output"]
+
+
+def already_ran(state, name: str) -> bool:
+    return any(f.startswith(f"[{name}]") for f in state.get("findings", []))
+
+# =====================================================================
+# 6. Shared team state
+# =====================================================================
+class TeamState(TypedDict):
+    incident: str
+    # Reducer: parallel workers each append their summary without overwriting.
+    findings: Annotated[list[str], operator.add]
+    next_agents: list[str]
+    supervisor_steps: int
+    critique: str
+    retry_count: int
+    max_retries: int
+    is_verified: bool
+    proposed_command: Optional[str]
+    approved: bool
+
+# =====================================================================
+# 7. Worker agents: private ReAct loop, summary-only output
+# =====================================================================
+def build_worker_prompt(agent_name: str) -> str:
+    scope = AGENT_SCOPES[agent_name]
+    catalog = discover_skills(allowed=scope["skills"])
+    catalog_yaml = yaml.dump(catalog, default_flow_style=False) if catalog else "None"
+    return f"""You are the {scope['role']} on an SRE team. Other agents handle other work.
+
+Your tools: {', '.join(scope['tools'])}.
+Read-only: {scope['read_only']}. Only read-only commands are permitted.
+Your assigned skills catalog:
+{catalog_yaml}
+
+To call a tool, respond ONLY with JSON: {{"action": "<tool_name>", "args": {{...}}}}
+When finished, respond in plain text: verified findings with brief evidence quoted from command output.
+Do not propose remediation. Another agent handles that.
+"""
+
+
+def run_worker(agent_name: str, task: str) -> str:
+    """Private ReAct loop. Its transcript never leaves this function."""
+    scope = AGENT_SCOPES[agent_name]
+    allowed = {name: TOOL_IMPLS[name] for name in scope["tools"]}
+    turns = [
+        {"role": "system", "content": build_worker_prompt(agent_name)},
+        {"role": "user", "content": task},
+    ]
+
+    for _ in range(WORKER_MAX_STEPS):
+        output = call_velona(turns)
+        turns.append({"role": "assistant", "content": output})
+        action = extract_json_object(output, must_key="action")
+        if not action:
+            return output.strip()[:SUMMARY_CHAR_LIMIT]   # final summary
+
+        name = action.get("action")
+        args = action.get("args", {}) or {}
+
+        # Enforced here in code, not just described in the prompt.
+        if name not in allowed:
+            obs = f"REJECTED: '{name}' is outside your tool scope ({', '.join(scope['tools'])})."
+        elif name == "run_command" and scope["read_only"] and is_mutating(str(args.get("command", ""))):
+            obs = "REJECTED: this agent is read-only. Use a read-only command."
+        elif name == "load_skill_body" and args.get("skill_name") not in scope["skills"]:
+            obs = "REJECTED: this skill is not assigned to your agent."
+        else:
+            try:
+                obs = allowed[name](**args)
+            except Exception as e:
+                obs = f"Error executing {name}: {e}"
+
+        log.info("[%s] %s -> %s", agent_name, name, str(obs)[:80].replace("\n", " "))
+        turns.append({"role": "user", "content": f"[Tool Output ({name})]:\n{obs}"})
+
+    return "Step budget reached for this specialist; no final summary was produced."
+
+
+def make_worker_node(agent_name: str):
+    def worker(state: TeamState) -> dict:
+        task = (
+            f"Incident: {state['incident']}\n"
+            f"Investigate within your scope. Return a concise summary of verified facts."
+        )
+        summary = run_worker(agent_name, task)
+        return {"findings": [f"[{agent_name}] {summary}"]}
+    worker.__name__ = agent_name
+    return worker
+
+# =====================================================================
+# 8. Supervisor: routes, fans out in parallel, never diagnoses itself
+# =====================================================================
+def supervisor_node(state: TeamState) -> dict:
+    steps = state.get("supervisor_steps", 0)
+    if steps >= MAX_SUPERVISOR_STEPS:
+        log.warning("Supervisor step budget reached; sending to reflector.")
+        return {"next_agents": [], "supervisor_steps": steps}
+
+    catalog = "\n".join(f"- {n}: {s['description']}" for n, s in AGENT_SCOPES.items())
+    catalog += "\n- remediation: proposes ONE mutating fix. Only after diagnosis findings exist."
+    findings_text = "\n".join(state.get("findings", [])) or "None yet"
+    critique_text = f"\nReflector critique to address: {state['critique']}" if state.get("critique") else ""
+
+    prompt = f"""You are the SUPERVISOR of an SRE team. Route work. Do not diagnose yourself.
+
+Agents you can route to:
+{catalog}
+- FINISH: enough evidence has been gathered. Send to the reflector.
+
+Rules:
+- Route only what this incident needs.
+- Choose several independent agents at once. They run in parallel.
+- Never choose an agent whose findings already exist.
+
+Incident: {state['incident']}
+Findings so far:
+{findings_text}{critique_text}
+
+Respond ONLY with JSON: {{"next": ["agent_name", ...]}} or {{"next": ["FINISH"]}}.
+"""
+    raw = call_velona([{"role": "user", "content": prompt}])
+    parsed = extract_json_object(raw, must_key="next") or {}
+    requested = parsed.get("next", [])
+    if isinstance(requested, str):
+        requested = [requested]
+
+    targets = []
+    for choice in requested:
+        if choice == "FINISH":
+            targets = []
+            break
+        if choice not in SUPERVISOR_CHOICES:
+            log.warning("Supervisor requested unknown agent '%s'; ignoring.", choice)
+            continue
+        if already_ran(state, choice) or choice in targets:
+            continue
+        targets.append(choice)
+
+    node_for = {"remediation": "remediation_propose"}
+    next_nodes = [node_for.get(t, t) for t in targets]
+    log.info("Supervisor routes -> %s", next_nodes or "reflector")
+    return {"next_agents": next_nodes, "supervisor_steps": steps + 1}
+
+
+def route_supervisor(state: TeamState):
+    targets = state.get("next_agents", [])
+    if not targets:
+        return "reflector"
+    if len(targets) == 1:
+        return targets[0]
+    # Dynamic fan-out: each target starts in the same superstep and runs in parallel.
+    payload = {
+        "incident": state["incident"],
+        "findings": state.get("findings", []),
+    }
+    return [Send(t, payload) for t in targets]
+
+# =====================================================================
+# 9. Gated remediation: propose (LLM) -> approve (no LLM) -> execute
+# =====================================================================
+def remediation_propose(state: TeamState) -> dict:
+    """[LLM] Proposes at most one command. Does not execute anything."""
+    findings_text = "\n".join(state.get("findings", [])) or "None"
+    prompt = f"""You are the REMEDIATION PROPOSER. Propose ONE shell command that mitigates the incident,
+based only on the findings below. If no mitigation is justified by the evidence, return an empty command.
+
+Incident: {state['incident']}
+Findings:
+{findings_text}
+
+Respond ONLY with JSON: {{"command": "<shell command or empty>", "rationale": "<short reason>"}}
+"""
+    raw = call_velona([{"role": "user", "content": prompt}])
+    obj = extract_json_object(raw, must_key="command") or {}
+    command = (obj.get("command") or "").strip()
+    if not command:
+        return {
+            "findings": ["[remediation] No mitigation was proposed from the current evidence."],
+            "proposed_command": None,
+            "approved": False,
+        }
+    return {"proposed_command": command, "approved": False}
+
+
+def route_after_propose(state: TeamState) -> str:
+    return "approval_gate" if state.get("proposed_command") else "supervisor"
+
+
+def approval_gate(state: TeamState) -> dict:
+    """
+    [Deterministic, no LLM] Read-only proposals pass. Mutating proposals pause for a human.
+    No LLM call here, so resuming after the interrupt re-runs nothing expensive.
+    """
+    cmd = state["proposed_command"]
+    if not is_mutating(cmd):
+        return {"approved": True}
+    decision = interrupt({
+        "proposed_command": cmd,
+        "question": "Approve running this mutating remediation command?",
+    })
+    return {"approved": bool(decision and decision.get("approved") is True)}
+
+
+def remediation_execute(state: TeamState) -> dict:
+    cmd = state["proposed_command"]
+    if not state.get("approved"):
+        return {
+            "findings": [f"[remediation] Operator rejected the proposed command: {cmd}"],
+            "proposed_command": None,
+        }
+    output = run_command(cmd)
+    return {
+        "findings": [f"[remediation] Ran approved command `{cmd}`. Output: {output[:SUMMARY_CHAR_LIMIT]}"],
+        "proposed_command": None,
+    }
+
+# =====================================================================
+# 10. Reflector: single gate over the combined team output
+# =====================================================================
+def reflector_node(state: TeamState) -> dict:
+    findings_text = "\n---\n".join(state.get("findings", [])) or "No findings were produced."
+    prompt = f"""You are a Principal SRE Reviewer. Audit the combined team findings against the original request.
+
+Original incident request:
+{state['incident']}
+
+Team findings (summaries from each specialist):
+{findings_text}
+
+Audit criteria:
+1. Grounding: are claims backed by evidence in the findings?
+2. Completeness: is there a root cause and a remediation (or explicit next steps)?
+3. Safety: was any mutating command run without approval?
+
+Respond ONLY in JSON:
+{{"is_satisfactory": true/false, "critique": "deficiencies or empty string", "recommended_action": "next step"}}
+"""
+    response = call_velona([{"role": "user", "content": prompt}])
+    parsed = extract_json_object(response, must_key="is_satisfactory")
+
+    if parsed is None:
+        log.warning("Reflector output unparseable; failing closed.")
+        is_satisfactory = False
+        critique = "Reviewer output could not be parsed."
+        recommended = "Re-verify root causes and remediation against the findings."
+    else:
+        value = parsed["is_satisfactory"]
+        is_satisfactory = value if isinstance(value, bool) else str(value).lower() == "true"
+        critique = parsed.get("critique", "")
+        recommended = parsed.get("recommended_action", "")
+
+    if is_satisfactory:
+        log.info("Reflector PASSED.")
+        return {"is_verified": True, "critique": ""}
+
+    retry = state.get("retry_count", 0) + 1
+    log.warning("Reflector FAILED (retry %d): %s", retry, critique)
+    return {
+        "is_verified": False,
+        "critique": f"{critique} Recommended: {recommended}".strip(),
+        "retry_count": retry,
+    }
+
+
+def route_reflection(state: TeamState) -> str:
+    if state.get("is_verified"):
+        return END
+    if state.get("retry_count", 0) >= state.get("max_retries", DEFAULT_MAX_RETRIES):
+        log.warning("Max reflection retries reached. Returning best-effort, UNVERIFIED answer.")
+        return END
+    return "supervisor"
+
+# =====================================================================
+# 11. Graph assembly
+# =====================================================================
+def build_team_graph(checkpointer=None):
+    builder = StateGraph(TeamState)
+
+    builder.add_node("supervisor", supervisor_node)
+    for name in AGENT_SCOPES:
+        builder.add_node(name, make_worker_node(name))
+    builder.add_node("remediation_propose", remediation_propose)
+    builder.add_node("approval_gate", approval_gate)
+    builder.add_node("remediation_execute", remediation_execute)
+    builder.add_node("reflector", reflector_node)
+
+    # Only the supervisor is reachable from START. Specialists are never called by default.
+    builder.add_edge(START, "supervisor")
+    builder.add_conditional_edges(
+        "supervisor",
+        route_supervisor,
+        ["log_agent", "health_agent", "remediation_propose", "reflector"],
+    )
+
+    # Workers report back to the supervisor. Parallel workers all finish in the same superstep.
+    for name in AGENT_SCOPES:
+        builder.add_edge(name, "supervisor")
+
+    builder.add_conditional_edges(
+        "remediation_propose",
+        route_after_propose,
+        {"approval_gate": "approval_gate", "supervisor": "supervisor"},
+    )
+    builder.add_edge("approval_gate", "remediation_execute")
+    builder.add_edge("remediation_execute", "supervisor")
+
+    builder.add_conditional_edges(
+        "reflector",
+        route_reflection,
+        {"supervisor": "supervisor", END: END},
+    )
+
+    # MemorySaver is for development. Use a persistent checkpointer in production.
+    return builder.compile(checkpointer=checkpointer or MemorySaver())
+
+# =====================================================================
+# 12. Runner with human approval
+# =====================================================================
+def ask_operator(request: dict) -> dict:
+    print("\n[HITL] Remediation requested a mutating command:")
+    print(f"  {request.get('proposed_command')}")
+    answer = input("Approve this command? [y/N]: ").strip().lower()
+    return {"approved": answer == "y"}
+
+
+def run_team_workflow(incident: str, max_retries: int = DEFAULT_MAX_RETRIES,
+                      approver=None, thread_id: Optional[str] = None) -> list[str]:
+    graph = build_team_graph()
+    config = {
+        "configurable": {"thread_id": thread_id or str(uuid.uuid4())},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+    initial_state: TeamState = {
+        "incident": incident,
+        "findings": [],
+        "next_agents": [],
+        "supervisor_steps": 0,
+        "critique": "",
+        "retry_count": 0,
+        "max_retries": max_retries,
+        "is_verified": False,
+        "proposed_command": None,
+        "approved": False,
+    }
+
+    graph.invoke(initial_state, config)
+
+    while True:
+        snapshot = graph.get_state(config)
+        if not snapshot.next:
+            break
+        pending = [i for t in snapshot.tasks for i in t.interrupts]
+        request = pending[0].value if pending else {}
+        decision = (approver or ask_operator)(request)
+        graph.invoke(Command(resume=decision), config)
+
+    values = graph.get_state(config).values
+    label = "VERIFIED" if values.get("is_verified") else "UNVERIFIED (best effort)"
+    print("\n=======================================================")
+    print(f"TEAM REPORT [{label}]")
+    print("=======================================================")
+    print("\n".join(values.get("findings", [])) or "No findings.")
+    return values.get("findings", [])
+
+
+def main():
+    incident = "Production service is reporting high latency. Can you triage and inspect error logs?"
+    print(f"Incident: {incident}")
+    run_team_workflow(incident)
+
+
+if __name__ == "__main__":
+    main()
